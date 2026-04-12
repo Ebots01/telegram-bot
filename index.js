@@ -1,94 +1,171 @@
-// backend/index.js
-
+// index.js
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
+const bodyParser = require('body-parser');
 const fs = require('fs');
 const path = require('path');
-const bodyParser = require('body-parser');
-const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
+const cors = require('cors');
 
-// === CONFIG ===
-const TOKEN = "";  // Replace with real BotFather token
-const PORT = 3000;
-const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+const app = express();
+app.use(bodyParser.json());
+app.use(cors());
 
-// In-memory "DB" (replace with MongoDB/MySQL later if needed)
-let pinToFileMap = {};
+// === CONFIGURATION ===
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const PORT = process.env.PORT || 3000;
 
-// === TELEGRAM BOT ===
-const bot = new TelegramBot(TOKEN, { polling: true });
-
-// Generate random 4-digit PIN
-function generatePin() {
-  return Math.floor(1000 + Math.random() * 9000).toString();
+// Render's temporary filesystem
+const UPLOAD_DIR = path.join("/tmp", "uploads");
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
-// Save file helper
-async function saveFile(fileId, originalName, chatId) {
+// === IN-MEMORY STORAGE (Replaces MongoDB) ===
+// This stores our active PINs and filenames. Wiped when server restarts.
+const activeFiles = new Map(); 
+let activityLog = [];
+
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
+
+// === HELPERS ===
+function generatePin() {
+  let pin;
+  do {
+    pin = Math.floor(1000 + Math.random() * 9000).toString();
+  } while (activeFiles.has(pin)); // Ensure no duplicate PINs
+  return pin;
+}
+
+function log(msg) {
+  const time = new Date().toLocaleTimeString();
+  console.log(`[${time}] ${msg}`);
+  activityLog.unshift(`[${time}] ${msg}`);
+  if (activityLog.length > 50) activityLog.pop();
+}
+
+async function handleTelegramFile(msg) {
+  const chatId = msg.chat.id;
+  const fileId = msg.document ? msg.document.file_id : msg.photo[msg.photo.length - 1].file_id;
+  const originalName = msg.document ? msg.document.file_name : `photo_${Date.now()}.jpg`;
+  
   try {
-    const file = await bot.getFile(fileId);
-    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`;
+    log(`⏳ Downloading ${originalName} from Telegram...`);
+    const fileUrl = await bot.getFileLink(fileId);
+    
+    // Download from Telegram
+    const response = await fetch(fileUrl);
+    const buffer = Buffer.from(await response.arrayBuffer());
 
+    // Generate PIN and save file
     const pin = generatePin();
-    const ext = path.extname(originalName) || "";
+    const ext = path.extname(originalName) || ".jpg";
     const newFileName = `${pin}${ext}`;
-    const filePath = path.join(uploadDir, newFileName);
+    const filePath = path.join(UPLOAD_DIR, newFileName);
 
-    const res = await fetch(url);
-    const buffer = Buffer.from(await res.arrayBuffer());
     fs.writeFileSync(filePath, buffer);
+    
+    // Save to our In-Memory Map instead of MongoDB
+    activeFiles.set(pin, {
+      filename: newFileName,
+      original_name: originalName,
+      time: new Date()
+    });
 
-    pinToFileMap[pin] = newFileName;
-
-    bot.sendMessage(chatId, `✅ File saved!\nYour PIN is: *${pin}*`, { parse_mode: "Markdown" });
+    log(`✅ Saved: ${newFileName} for PIN ${pin}`);
+    await bot.sendMessage(chatId, `✅ Received!\nYour PIN: *${pin}*\n\n_Note: This PIN will expire if the server goes to sleep._`, { parse_mode: 'Markdown' });
   } catch (err) {
-    console.error(err);
-    bot.sendMessage(chatId, "❌ Error saving file");
+    log(`❌ Download Error: ${err.message}`);
+    await bot.sendMessage(chatId, "❌ Failed to save file. Try again.");
   }
 }
 
-// Handle documents (PDF, Word, etc.)
-bot.on("document", async (msg) => {
-  const chatId = msg.chat.id;
-  await saveFile(msg.document.file_id, msg.document.file_name, chatId);
+// === TELEGRAM WEBHOOK ===
+app.post("/telegram-webhook", (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
 });
 
-// Handle photos (JPG, PNG, etc.)
-bot.on("photo", async (msg) => {
-  const chatId = msg.chat.id;
-  const photos = msg.photo;
-
-  // Get highest resolution photo
-  const photo = photos[photos.length - 1];
-
-  // Use .jpg as default extension
-  await saveFile(photo.file_id, `photo_${Date.now()}.jpg`, chatId);
+bot.on('message', (msg) => {
+  if (msg.document || msg.photo) {
+    handleTelegramFile(msg);
+  } else if (msg.text === "/start") {
+    bot.sendMessage(msg.chat.id, "👋 Send me a document or photo to get a PIN for the kiosk!");
+  }
 });
 
-// === EXPRESS BACKEND ===
-const app = express();
-app.use(bodyParser.json());
+// === FLUTTER APP APIs ===
 
-// Verify PIN API
+// 1. Serve the actual files so Flutter can download them
+app.use("/files", express.static(UPLOAD_DIR));
+
+// 2. Verify PIN (Flutter app calls this to check if a PIN exists)
 app.post("/verify-pin", (req, res) => {
   const { pin } = req.body;
 
-  if (pinToFileMap[pin]) {
-    const filename = pinToFileMap[pin];
-    const fileUrl = `/files/${filename}`;
-    console.log(`PIN verified: ${pin} -> ${filename}`);
-
-    return res.json({ success: true, fileUrl });
+  if (activeFiles.has(pin)) {
+    const fileData = activeFiles.get(pin);
+    // Send back the URL where Flutter can download the file
+    return res.json({ 
+      success: true, 
+      fileUrl: `/files/${fileData.filename}`,
+      filename: fileData.filename
+    });
   } else {
-    return res.json({ success: false, message: "Invalid PIN" });
+    return res.json({ success: false, message: "Invalid or Expired PIN" });
   }
 });
 
-// Serve uploaded files
-app.use("/files", express.static(uploadDir));
+// 3. Burn PIN (Flutter app calls this AFTER printing to delete the file)
+app.delete("/api/burn/:pin", (req, res) => {
+  const { pin } = req.params;
 
-// Start server
+  if (activeFiles.has(pin)) {
+    const fileData = activeFiles.get(pin);
+    const filePath = path.join(UPLOAD_DIR, fileData.filename);
+    
+    // Delete the physical file from the /tmp folder
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    
+    // Remove the PIN from memory
+    activeFiles.delete(pin);
+    
+    log(`🔥 Burned PIN: ${pin}. File deleted.`);
+    res.json({ success: true, message: "File securely deleted" });
+  } else {
+    res.status(404).json({ error: "PIN not found" });
+  }
+});
+
+// === STATUS DASHBOARD ===
+app.get("/", (req, res) => {
+  // Convert our Map to an array for the HTML dashboard
+  const currentFiles = Array.from(activeFiles.entries()).map(([pin, data]) => 
+    `<li><strong>PIN ${pin}:</strong> ${data.original_name}</li>`
+  ).join("");
+
+  res.send(`
+    <html>
+      <head><title>Kiosk Monitor</title><meta http-equiv="refresh" content="10"></head>
+      <body style="font-family:sans-serif; padding:20px; background:#f4f4f9;">
+        <h1>🤖 Telegram Kiosk Server (In-Memory)</h1>
+        
+        <div style="background:white; padding:15px; border-radius:8px; margin-bottom:20px;">
+          <h2>📂 Active PINs (${activeFiles.size})</h2>
+          <ul>${currentFiles || "No active PINs."}</ul>
+        </div>
+
+        <div style="background:white; padding:15px; border-radius:8px;">
+          <h2>📝 Live Logs</h2>
+          <div style="font-family:monospace; font-size: 14px;">${activityLog.join("<br>")}</div>
+        </div>
+      </body>
+    </html>
+  `);
+});
+
+// Start Server
 app.listen(PORT, () => {
-  console.log(`✅ Server running on http://localhost:${PORT}`);
+  log(`🚀 Server running on port ${PORT}`);
 });
