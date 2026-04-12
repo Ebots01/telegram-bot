@@ -64,7 +64,7 @@ async function handleTelegramFile(msg) {
 
     fs.writeFileSync(filePath, buffer);
     
-    // Save to our In-Memory Map instead of MongoDB
+    // Save to our In-Memory Map
     activeFiles.set(pin, {
       filename: newFileName,
       original_name: originalName,
@@ -95,10 +95,19 @@ bot.on('message', (msg) => {
 
 // === FLUTTER APP APIs ===
 
-// 1. Serve the actual files so Flutter can download them
+// 1. Polling Endpoint: Returns list of active files
+app.get("/api/files", (req, res) => {
+  const files = Array.from(activeFiles.entries()).map(([pin, data]) => ({
+    pin: pin,
+    fileName: data.filename
+  }));
+  res.json(files);
+});
+
+// 2. Serve the actual files so Flutter can download them
 app.use("/files", express.static(UPLOAD_DIR));
 
-// 2. Verify PIN (Flutter app calls this to check if a PIN exists)
+// 3. Verify PIN (Flutter app calls this to check if a PIN exists)
 app.post("/verify-pin", (req, res) => {
   const { pin } = req.body;
 
@@ -115,7 +124,7 @@ app.post("/verify-pin", (req, res) => {
   }
 });
 
-// 3. Burn PIN (Flutter app calls this AFTER printing to delete the file)
+// 4. Burn PIN (Flutter app calls this AFTER printing to delete the file)
 app.delete("/api/burn/:pin", (req, res) => {
   const { pin } = req.params;
 
@@ -140,7 +149,6 @@ app.delete("/api/burn/:pin", (req, res) => {
 
 // === STATUS DASHBOARD ===
 app.get("/", (req, res) => {
-  // Convert our Map to an array for the HTML dashboard
   const currentFiles = Array.from(activeFiles.entries()).map(([pin, data]) => 
     `<li><strong>PIN ${pin}:</strong> ${data.original_name}</li>`
   ).join("");
