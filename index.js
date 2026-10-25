@@ -13,6 +13,8 @@ app.use(cors());
 // === CONFIGURATION ===
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const PORT = process.env.PORT || 3000;
+// Files/PINs live for 2 minutes only, then are auto-deleted from the server
+const FILE_TTL_MS = Number(process.env.FILE_TTL_MS) || 2 * 60 * 1000;
 
 // Render's temporary filesystem
 const UPLOAD_DIR = path.join("/tmp", "uploads");
@@ -43,6 +45,32 @@ function log(msg) {
   if (activityLog.length > 50) activityLog.pop();
 }
 
+// Delete a PIN's file from disk + memory
+function removeFile(pin, reason) {
+  const data = activeFiles.get(pin);
+  if (!data) return false;
+  const filePath = path.join(UPLOAD_DIR, data.filename);
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch (e) {
+    log(`⚠️ Could not delete ${data.filename}: ${e.message}`);
+  }
+  activeFiles.delete(pin);
+  log(`${reason} PIN ${pin} (${data.original_name})`);
+  return true;
+}
+
+function isExpired(data) {
+  return Date.now() >= data.expiresAt;
+}
+
+// Sweep expired files every 10 seconds
+setInterval(() => {
+  for (const [pin, data] of activeFiles.entries()) {
+    if (isExpired(data)) removeFile(pin, '⏰ Expired');
+  }
+}, 10 * 1000);
+
 async function handleTelegramFile(msg) {
   const chatId = msg.chat.id;
   const fileId = msg.document ? msg.document.file_id : msg.photo[msg.photo.length - 1].file_id;
@@ -54,6 +82,7 @@ async function handleTelegramFile(msg) {
     
     // Download from Telegram
     const response = await fetch(fileUrl);
+    if (!response.ok) throw new Error(`Telegram returned ${response.status}`);
     const buffer = Buffer.from(await response.arrayBuffer());
 
     // Generate PIN and save file
@@ -68,11 +97,12 @@ async function handleTelegramFile(msg) {
     activeFiles.set(pin, {
       filename: newFileName,
       original_name: originalName,
-      time: new Date()
+      time: new Date(),
+      expiresAt: Date.now() + FILE_TTL_MS
     });
 
     log(`✅ Saved: ${newFileName} for PIN ${pin}`);
-    await bot.sendMessage(chatId, `✅ Received!\nYour PIN: *${pin}*\n\n_Note: This PIN will expire if the server goes to._`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `✅ Received!\nYour PIN: *${pin}*\n\n_This PIN is valid for ${Math.round(FILE_TTL_MS / 60000)} minutes only._`, { parse_mode: 'Markdown' });
   } catch (err) {
     log(`❌ Download Error: ${err.message}`);
     await bot.sendMessage(chatId, "❌ Failed to save file. Try again.");
@@ -97,10 +127,13 @@ bot.on('message', (msg) => {
 
 // 1. Polling Endpoint: Returns list of active files
 app.get("/api/files", (req, res) => {
-  const files = Array.from(activeFiles.entries()).map(([pin, data]) => ({
-    pin: pin,
-    fileName: data.filename
-  }));
+  const files = Array.from(activeFiles.entries())
+    .filter(([, data]) => !isExpired(data))
+    .map(([pin, data]) => ({
+      pin: pin,
+      fileName: data.filename,
+      expiresInSec: Math.max(0, Math.round((data.expiresAt - Date.now()) / 1000))
+    }));
   res.json(files);
 });
 
@@ -111,8 +144,8 @@ app.use("/files", express.static(UPLOAD_DIR));
 app.post("/verify-pin", (req, res) => {
   const { pin } = req.body;
 
-  if (activeFiles.has(pin)) {
-    const fileData = activeFiles.get(pin);
+  const fileData = activeFiles.get(String(pin));
+  if (fileData && !isExpired(fileData)) {
     // Send back the URL where Flutter can download the file
     return res.json({ 
       success: true, 
@@ -128,19 +161,7 @@ app.post("/verify-pin", (req, res) => {
 app.delete("/api/burn/:pin", (req, res) => {
   const { pin } = req.params;
 
-  if (activeFiles.has(pin)) {
-    const fileData = activeFiles.get(pin);
-    const filePath = path.join(UPLOAD_DIR, fileData.filename);
-    
-    // Delete the physical file from the /tmp folder
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-    
-    // Remove the PIN from memory
-    activeFiles.delete(pin);
-    
-    log(`🔥 Burned PIN: ${pin}. File deleted.`);
+  if (removeFile(pin, '🔥 Burned')) {
     res.json({ success: true, message: "File securely deleted" });
   } else {
     res.status(404).json({ error: "PIN not found" });
