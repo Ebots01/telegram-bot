@@ -72,7 +72,7 @@ async function handleTelegramFile(msg) {
     });
 
     log(`✅ Saved: ${newFileName} for PIN ${pin}`);
-    await bot.sendMessage(chatId, `✅ Received!\nYour PIN: *${pin}*\n\n_Note: This PIN will expire if the server goes to sleep._`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `✅ Received!\nYour PIN: *${pin}*\n\n_Note: This PIN will expire if the server goes to._`, { parse_mode: 'Markdown' });
   } catch (err) {
     log(`❌ Download Error: ${err.message}`);
     await bot.sendMessage(chatId, "❌ Failed to save file. Try again.");
