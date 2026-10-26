@@ -4,6 +4,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const cors = require('cors');
 
 const app = express();
@@ -95,6 +96,7 @@ async function handleTelegramFile(msg) {
     
     // Save to our In-Memory Map
     activeFiles.set(pin, {
+      id: crypto.randomUUID(), // unique per upload (PINs can be reused)
       filename: newFileName,
       original_name: originalName,
       time: new Date(),
@@ -130,6 +132,7 @@ app.get("/api/files", (req, res) => {
   const files = Array.from(activeFiles.entries())
     .filter(([, data]) => !isExpired(data))
     .map(([pin, data]) => ({
+      id: data.id,
       pin: pin,
       fileName: data.filename,
       expiresInSec: Math.max(0, Math.round((data.expiresAt - Date.now()) / 1000))
